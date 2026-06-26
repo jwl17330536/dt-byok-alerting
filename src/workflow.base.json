@@ -1,0 +1,112 @@
+{
+  "title": "BYOK Key Access Monitor",
+  "description": "Detects when a Bring-Your-Own-Key (BYOK) encryption key becomes inaccessible. Every 5 minutes it polls the Dynatrace Account Management Notifications API (BYOK_REVOKED / BYOK_ACTIVATED) via a small Run JavaScript task, ingests per-record custom events, then uses NATIVE workflow actions (conditions, Send email, HTTP request with Credential Vault auth) to alert and open/resolve an external incident. No native BYOK trigger is assumed. See README.md > Getting Started.",
+  "isPrivate": false,
+  "trigger": {
+    "schedule": {
+      "trigger": { "type": "cron", "cron": "*/5 * * * *" },
+      "timezone": "UTC",
+      "isActive": true,
+      "rule": null,
+      "filterParameters": {},
+      "inputs": {}
+    }
+  },
+  "tasks": {
+    "fetch_byok_notifications": {
+      "name": "fetch_byok_notifications",
+      "description": "Code-only step: OAuth (vault) -> Account Management Notifications API (last 10m) -> parse, dedupe, persistence-gate, ingest per-record custom events. Returns flags + text for the native tasks below.",
+      "action": "dynatrace.automations:run-javascript",
+      "position": { "x": 0, "y": 1 },
+      "predecessors": [],
+      "conditions": null,
+      "input": { "script": "__SCRIPT__" }
+    },
+    "alert_email_byok_revoked": {
+      "name": "alert_email_byok_revoked",
+      "description": "NATIVE Send email — severe alert when one or more BYOK keys are revoked. Edit recipients in the UI.",
+      "action": "dynatrace.email:send-email",
+      "position": { "x": -1, "y": 2 },
+      "predecessors": ["fetch_byok_notifications"],
+      "conditions": {
+        "states": { "fetch_byok_notifications": "SUCCESS" },
+        "custom": "{{ result('fetch_byok_notifications').hasRevoked }}",
+        "else": "STOP"
+      },
+      "input": {
+        "to": ["byok-oncall@example.com"],
+        "cc": [],
+        "bcc": [],
+        "subject": "SEVERE: Dynatrace cannot access BYOK key — action required",
+        "content": "__REVOKED_EMAIL__"
+      }
+    },
+    "create_incident_byok_revoked": {
+      "name": "create_incident_byok_revoked",
+      "description": "NATIVE HTTP request — open a severity-1 incident (ServiceNow / generic webhook). Auth via Credential Vault. Fires only when a revoke passes the persistence safety gate.",
+      "action": "dynatrace.automations:http-function",
+      "position": { "x": 1, "y": 2 },
+      "predecessors": ["fetch_byok_notifications"],
+      "conditions": {
+        "states": { "fetch_byok_notifications": "SUCCESS" },
+        "custom": "{{ result('fetch_byok_notifications').hasIncident }}",
+        "else": "STOP"
+      },
+      "input": {
+        "method": "POST",
+        "url": "https://YOUR_INCIDENT_WEBHOOK_ENDPOINT",
+        "headers": { "Content-Type": "application/json" },
+        "failOnResponseCodes": "400-599",
+        "credential": {
+          "credentialId": "CREDENTIALS_VAULT-REPLACE_INCIDENT",
+          "type": "token",
+          "tokenPrefix": "Bearer"
+        },
+        "payload": "__INCIDENT_PAYLOAD__"
+      }
+    },
+    "recovery_email_byok_activated": {
+      "name": "recovery_email_byok_activated",
+      "description": "NATIVE Send email — recovery notice when BYOK key access is restored. Edit recipients in the UI.",
+      "action": "dynatrace.email:send-email",
+      "position": { "x": -1, "y": 3 },
+      "predecessors": ["fetch_byok_notifications"],
+      "conditions": {
+        "states": { "fetch_byok_notifications": "SUCCESS" },
+        "custom": "{{ result('fetch_byok_notifications').hasActivated }}",
+        "else": "STOP"
+      },
+      "input": {
+        "to": ["byok-oncall@example.com"],
+        "cc": [],
+        "bcc": [],
+        "subject": "INFO: Dynatrace BYOK key access restored",
+        "content": "__RECOVERY_EMAIL__"
+      }
+    },
+    "resolve_incident_byok_activated": {
+      "name": "resolve_incident_byok_activated",
+      "description": "NATIVE HTTP request — resolve/update the external incident on recovery. Auth via Credential Vault. Optional — disable or repoint if you do not manage incidents externally.",
+      "action": "dynatrace.automations:http-function",
+      "position": { "x": 1, "y": 3 },
+      "predecessors": ["fetch_byok_notifications"],
+      "conditions": {
+        "states": { "fetch_byok_notifications": "SUCCESS" },
+        "custom": "{{ result('fetch_byok_notifications').hasActivated }}",
+        "else": "STOP"
+      },
+      "input": {
+        "method": "POST",
+        "url": "https://YOUR_INCIDENT_WEBHOOK_ENDPOINT",
+        "headers": { "Content-Type": "application/json" },
+        "failOnResponseCodes": "400-599",
+        "credential": {
+          "credentialId": "CREDENTIALS_VAULT-REPLACE_INCIDENT",
+          "type": "token",
+          "tokenPrefix": "Bearer"
+        },
+        "payload": "__RECOVERY_PAYLOAD__"
+      }
+    }
+  }
+}

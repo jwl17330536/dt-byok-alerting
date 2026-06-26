@@ -1,0 +1,11 @@
+{
+  "severity": 1,
+  "status": "open",
+  "short_description": "Dynatrace BYOK key access lost",
+  "description": "{{ result('fetch_byok_notifications').impactText }}\n\nEnvironment UUID: {{ result('fetch_byok_notifications').primaryRevoked.environmentUuid }}\nKey name: {{ result('fetch_byok_notifications').primaryRevoked.keyName }}\nNotification date: {{ result('fetch_byok_notifications').primaryRevoked.date }}\nSeverity: {{ result('fetch_byok_notifications').primaryRevoked.severity }}\nAffected key count: {{ result('fetch_byok_notifications').incidentCount }}",
+  "environmentUuid": "{{ result('fetch_byok_notifications').primaryRevoked.environmentUuid }}",
+  "keyName": "{{ result('fetch_byok_notifications').primaryRevoked.keyName }}",
+  "notificationDate": "{{ result('fetch_byok_notifications').primaryRevoked.date }}",
+  "dedupeKey": "{{ result('fetch_byok_notifications').primaryRevoked.dedupeKey }}",
+  "notificationType": "BYOK_REVOKED"
+}

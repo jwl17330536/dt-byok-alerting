@@ -1,0 +1,11 @@
+{
+  "severity": 3,
+  "status": "resolved",
+  "short_description": "Dynatrace BYOK key access restored",
+  "description": "BYOK key access restored.\n\nEnvironment UUID: {{ result('fetch_byok_notifications').primaryActivated.environmentUuid }}\nKey name: {{ result('fetch_byok_notifications').primaryActivated.keyName }}\nNotification date: {{ result('fetch_byok_notifications').primaryActivated.date }}",
+  "environmentUuid": "{{ result('fetch_byok_notifications').primaryActivated.environmentUuid }}",
+  "keyName": "{{ result('fetch_byok_notifications').primaryActivated.keyName }}",
+  "notificationDate": "{{ result('fetch_byok_notifications').primaryActivated.date }}",
+  "dedupeKey": "{{ result('fetch_byok_notifications').primaryActivated.dedupeKey }}",
+  "notificationType": "BYOK_ACTIVATED"
+}

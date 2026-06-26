@@ -1,0 +1,156 @@
+{
+  "title": "BYOK Key Access Monitor",
+  "description": "Detects when a Bring-Your-Own-Key (BYOK) encryption key becomes inaccessible. Every 5 minutes it polls the Dynatrace Account Management Notifications API (BYOK_REVOKED / BYOK_ACTIVATED) via a small Run JavaScript task, ingests per-record custom events, then uses NATIVE workflow actions (conditions, Send email, HTTP request with Credential Vault auth) to alert and open/resolve an external incident. No native BYOK trigger is assumed. See README.md > Getting Started.",
+  "isPrivate": false,
+  "trigger": {
+    "schedule": {
+      "trigger": {
+        "type": "cron",
+        "cron": "*/5 * * * *"
+      },
+      "timezone": "UTC",
+      "isActive": true,
+      "rule": null,
+      "filterParameters": {},
+      "inputs": {}
+    }
+  },
+  "tasks": {
+    "fetch_byok_notifications": {
+      "name": "fetch_byok_notifications",
+      "description": "Code-only step: OAuth (vault) -> Account Management Notifications API (last 10m) -> parse, dedupe, persistence-gate, ingest per-record custom events. Returns flags + text for the native tasks below.",
+      "action": "dynatrace.automations:run-javascript",
+      "position": {
+        "x": 0,
+        "y": 1
+      },
+      "predecessors": [],
+      "conditions": null,
+      "input": {
+        "script": "/**\n * BYOK Key Access Monitor — task: fetch_byok_notifications\n *\n * This is the ONLY code in the workflow. Everything a customer normally wants to\n * customize (notifications, incident creation, branching) is handled by NATIVE\n * workflow actions downstream (Send email, HTTP request, conditions). This task\n * only does the things that genuinely require code:\n *\n *   1. Read OAuth client credentials from the Credential Vault (no hardcoded secrets).\n *   2. Get a bearer token from Dynatrace SSO (scope account-uac-read).\n *   3. POST the Account Management Notifications API (last 10 minutes,\n *      types BYOK_REVOKED / BYOK_ACTIVATED). There is NO native BYOK trigger;\n *      this API is the source of truth.\n *   4. Parse + deduplicate records and apply the persistence safety gate.\n *   5. Ingest a per-record Dynatrace custom event (loop -> needs code):\n *        BYOK_REVOKED   -> CUSTOM_ALERT \"BYOK key access lost\"\n *        BYOK_ACTIVATED -> CUSTOM_INFO  \"BYOK key access restored\"\n *   6. Return clean flags + pre-rendered text that the native downstream tasks\n *      consume via {{ result('fetch_byok_notifications').<field> }}.\n *\n * Downstream native tasks read these returned fields:\n *   hasRevoked, hasActivated, hasIncident   -> condition gates\n *   incidentCount                           -> incident payload\n *   primaryRevoked / primaryActivated       -> incident / recovery payloads\n *   revokedText / activatedText             -> email body (markdown)\n */\nimport {\n  eventsClient,\n  EventIngestEventType,\n  credentialVaultClient,\n} from \"@dynatrace-sdk/client-classic-environment-v2\";\nimport { queryExecutionClient } from \"@dynatrace-sdk/client-query\";\n\n// ---------------------------------------------------------------------------\n// Configuration — NO SECRETS INLINE. Set the two values below, then deploy.\n// ---------------------------------------------------------------------------\n\n// Your Dynatrace account UUID (NOT a secret). Account Management > IAM > OAuth clients.\nconst ACCOUNT_UUID = \"<REPLACE_WITH_ACCOUNT_UUID>\";\n\n// Credential Vault entry of type \"User and password\":\n//   user     = OAuth client_id\n//   password = OAuth client_secret      (client needs scope: account-uac-read)\nconst OAUTH_CREDENTIAL_VAULT_ID = \"<REPLACE_WITH_CREDENTIALS_VAULT_ID>\";\n\n// Behavior knobs.\nconst LOOKBACK_MINUTES = 10;\nconst SAFETY_MIN_PERSIST_MINUTES = 5; // only flag an incident if a revoke is at least this old and not yet recovered\nconst ENABLE_PERSISTENCE_SAFETY = true;\nconst ENABLE_CROSS_RUN_DEDUP = true; // best-effort dedup across overlapping runs (Grail); degrades gracefully\n\n// Constants.\nconst OAUTH_SCOPES = [\"account-uac-read\"];\nconst SSO_TOKEN_URL = \"https://sso.dynatrace.com/sso/oauth2/token\";\nconst ACCOUNT_API_BASE = \"https://api.dynatrace.com\";\n\nconst REVOKED_IMPACT =\n  \"Dynatrace cannot access the customer-managed encryption key. Per Dynatrace \" +\n  \"documentation, no new data can be written to permanent storage, Dashboards, \" +\n  \"Notebooks, and Workflows cannot be saved, and ingested data may only be \" +\n  \"buffered temporarily.\";\n\n// ---------------------------------------------------------------------------\n// Helpers\n// ---------------------------------------------------------------------------\n\nfunction isoMinutesAgo(minutes) {\n  return new Date(Date.now() - minutes * 60 * 1000).toISOString();\n}\n\nfunction nowIso() {\n  return new Date().toISOString();\n}\n\n// Filter values are UPPER_SNAKE (BYOK_REVOKED) but records come back lower-hyphen\n// (byok-revoked). Normalize both to UPPER_SNAKE for comparison.\nfunction normalizeType(type) {\n  return String(type || \"\").trim().toUpperCase().replace(/-/g, \"_\");\n}\n\nfunction requireConfigured(value, label) {\n  if (!value || String(value).includes(\"<REPLACE\")) {\n    throw new Error(`${label} is not configured. Set it in the task before deploying.`);\n  }\n  return value;\n}\n\nasync function resolveOauthCredentials() {\n  requireConfigured(OAUTH_CREDENTIAL_VAULT_ID, \"OAUTH_CREDENTIAL_VAULT_ID\");\n  const entry = await credentialVaultClient.getCredentialsDetails({ id: OAUTH_CREDENTIAL_VAULT_ID });\n  const clientId = entry && (entry.user || entry.username);\n  const clientSecret = entry && (entry.password || entry.token);\n  if (!clientId || !clientSecret) {\n    throw new Error(\n      `Credential Vault entry ${OAUTH_CREDENTIAL_VAULT_ID} must be a \"User and password\" entry ` +\n        \"(user = OAuth client_id, password = OAuth client_secret).\",\n    );\n  }\n  return { clientId, clientSecret };\n}\n\nasync function getOauthToken({ clientId, clientSecret }) {\n  const response = await fetch(SSO_TOKEN_URL, {\n    method: \"POST\",\n    headers: { \"Content-Type\": \"application/x-www-form-urlencoded\" },\n    body: new URLSearchParams({\n      grant_type: \"client_credentials\",\n      client_id: clientId,\n      client_secret: clientSecret,\n      scope: OAUTH_SCOPES.join(\" \"),\n      resource: `urn:dtaccount:${ACCOUNT_UUID}`,\n    }),\n  });\n  if (!response.ok) {\n    const text = await response.text();\n    throw new Error(`Failed to obtain OAuth token. Status ${response.status}. Body: ${text}`);\n  }\n  const json = await response.json();\n  if (!json.access_token) throw new Error(\"OAuth token response did not contain an access_token.\");\n  return json.access_token;\n}\n\nasync function fetchNotifications(token, startDateTime, endDateTime) {\n  const url = `${ACCOUNT_API_BASE}/v1/accounts/${ACCOUNT_UUID}/notifications`;\n  const response = await fetch(url, {\n    method: \"POST\",\n    headers: { Authorization: `Bearer ${token}`, \"Content-Type\": \"application/json\" },\n    body: JSON.stringify({\n      startDateTime,\n      endDateTime,\n      types: [\"BYOK_REVOKED\", \"BYOK_ACTIVATED\"],\n      pageSize: 100,\n      sorts: [\"-date\"],\n    }),\n  });\n  const text = await response.text();\n  if (!response.ok) {\n    throw new Error(`Notifications API request failed. Status ${response.status}. Body: ${text}`);\n  }\n  return text ? JSON.parse(text) : {};\n}\n\nasync function ingestEvent({ eventType, title, properties }) {\n  return await eventsClient.createEvent({ body: { eventType, title, properties } });\n}\n\n// Best-effort cross-run dedup. Overlapping 10-minute windows on a 5-minute\n// schedule can surface the same notification twice. Skip if we already ingested\n// an event with this dedupe key. Any error degrades to in-window dedup only.\nasync function alreadyProcessed(dedupeKey) {\n  if (!ENABLE_CROSS_RUN_DEDUP) return false;\n  try {\n    const query =\n      `fetch events, from: now()-${LOOKBACK_MINUTES + 5}m\\n` +\n      `| filter byok_dedupe_key == \"${dedupeKey}\"\\n` +\n      `| limit 1`;\n    let response = await queryExecutionClient.queryExecute({\n      body: { query, requestTimeoutMilliseconds: 5000, fetchTimeoutSeconds: 10 },\n    });\n    let guard = 0;\n    while (response && response.state && response.state !== \"SUCCEEDED\" && guard < 20) {\n      if (!response.requestToken) break;\n      await new Promise((r) => setTimeout(r, 500));\n      response = await queryExecutionClient.queryPoll({ requestToken: response.requestToken });\n      guard += 1;\n    }\n    const records = (response && response.result && response.result.records) || [];\n    return records.length > 0;\n  } catch (error) {\n    console.log(`Cross-run dedup check skipped: ${error && error.message ? error.message : error}`);\n    return false;\n  }\n}\n\n// ---------------------------------------------------------------------------\n// Main\n// ---------------------------------------------------------------------------\n\nexport default async function () {\n  requireConfigured(ACCOUNT_UUID, \"ACCOUNT_UUID\");\n\n  const checkedWindowStart = isoMinutesAgo(LOOKBACK_MINUTES);\n  const checkedWindowEnd = nowIso();\n\n  const token = await getOauthToken(await resolveOauthCredentials());\n  const apiResponse = await fetchNotifications(token, checkedWindowStart, checkedWindowEnd);\n  const records = Array.isArray(apiResponse.records) ? apiResponse.records : [];\n\n  // Index latest activation per environment+key for the persistence safety gate.\n  const latestActivationByTarget = new Map();\n  for (const record of records) {\n    if (normalizeType(record.type) !== \"BYOK_ACTIVATED\") continue;\n    const d = record.details || {};\n    const target = `${d.environmentUuid || \"unknown\"}|${d.keyName || \"unknown\"}`;\n    const ts = Date.parse(record.date || \"\") || 0;\n    if (ts > (latestActivationByTarget.get(target) || 0)) latestActivationByTarget.set(target, ts);\n  }\n\n  const summary = {\n    checkedWindowStart,\n    checkedWindowEnd,\n    recordsSeen: records.length,\n    revokedEvents: 0,\n    activatedEvents: 0,\n    processed: [],\n  };\n\n  const revoked = [];\n  const activated = [];\n  let primaryRevoked = null; // most recent revoke that passed the safety gate (incident source)\n\n  const seen = new Set(); // in-window dedup: type + environmentUuid + keyName + date\n\n  for (const record of records) {\n    const eventType = normalizeType(record.type);\n    if (eventType !== \"BYOK_REVOKED\" && eventType !== \"BYOK_ACTIVATED\") continue;\n\n    const severity = String(record.severity || \"\");\n    const message = String(record.message || \"\");\n    const date = String(record.date || \"\");\n    const details = record.details || {};\n    const environmentUuid = details.environmentUuid || \"unknown\";\n    const keyName = details.keyName || \"unknown\";\n\n    const dedupeKey = `${eventType}|${environmentUuid}|${keyName}|${date}`;\n    if (seen.has(dedupeKey)) continue;\n    seen.add(dedupeKey);\n\n    if (await alreadyProcessed(dedupeKey)) {\n      summary.processed.push({ eventType, environmentUuid, keyName, date, action: \"skipped_already_processed\" });\n      continue;\n    }\n\n    const item = { environmentUuid, keyName, date, severity, message, dedupeKey };\n    const baseProperties = {\n      source: \"Dynatrace Account Management Notifications API\",\n      notification_type: eventType,\n      severity,\n      message,\n      notification_date: date,\n      environment_uuid: environmentUuid,\n      key_name: keyName,\n      byok_dedupe_key: dedupeKey,\n    };\n\n    if (eventType === \"BYOK_REVOKED\") {\n      summary.revokedEvents += 1;\n      revoked.push(item);\n\n      await ingestEvent({\n        eventType: EventIngestEventType.CustomAlert,\n        title: \"BYOK key access lost\",\n        properties: { ...baseProperties, impact: REVOKED_IMPACT },\n      });\n\n      // Persistence safety gate (requirement #6): incident only if the revoke is\n      // at least SAFETY_MIN_PERSIST_MINUTES old AND not followed by an activation.\n      const revokeTs = Date.parse(date) || 0;\n      const ageMinutes = revokeTs ? (Date.now() - revokeTs) / 60000 : Infinity;\n      const recoveredAfter = (latestActivationByTarget.get(`${environmentUuid}|${keyName}`) || 0) > revokeTs;\n      const passesGate = !ENABLE_PERSISTENCE_SAFETY || (ageMinutes >= SAFETY_MIN_PERSIST_MINUTES && !recoveredAfter);\n\n      item.incidentEligible = passesGate;\n      if (passesGate && (!primaryRevoked || revokeTs > (Date.parse(primaryRevoked.date) || 0))) {\n        primaryRevoked = item;\n      }\n      summary.processed.push({\n        eventType,\n        environmentUuid,\n        keyName,\n        date,\n        action: passesGate ? \"custom_event_ingested_incident_eligible\" : \"custom_event_ingested_incident_suppressed\",\n      });\n    } else {\n      summary.activatedEvents += 1;\n      activated.push(item);\n      await ingestEvent({\n        eventType: EventIngestEventType.CustomInfo,\n        title: \"BYOK key access restored\",\n        properties: baseProperties,\n      });\n      summary.processed.push({ eventType, environmentUuid, keyName, date, action: \"custom_event_ingested_recovery\" });\n    }\n  }\n\n  const renderList = (items) =>\n    items\n      .map(\n        (i) =>\n          `- **${i.keyName}** (env \\`${i.environmentUuid}\\`) — ${i.severity || \"n/a\"} at ${i.date}` +\n          (i.message ? `\\n  - ${i.message}` : \"\"),\n      )\n      .join(\"\\n\");\n\n  const incidentCount = revoked.filter((r) => r.incidentEligible).length;\n  const primaryActivated = activated.length ? activated[0] : null;\n\n  return {\n    ...summary,\n    // Flags for native condition gates:\n    hasRevoked: revoked.length > 0,\n    hasActivated: activated.length > 0,\n    hasIncident: incidentCount > 0,\n    incidentCount,\n    // Representative records for native incident/recovery payloads:\n    primaryRevoked: primaryRevoked || (revoked.length ? revoked[0] : null),\n    primaryActivated,\n    impactText: REVOKED_IMPACT,\n    // Pre-rendered markdown for native Send-email bodies:\n    revokedText: revoked.length ? renderList(revoked) : \"None\",\n    activatedText: activated.length ? renderList(activated) : \"None\",\n    // Lists if you want to template over them:\n    revoked,\n    activated,\n  };\n}\n"
+      }
+    },
+    "alert_email_byok_revoked": {
+      "name": "alert_email_byok_revoked",
+      "description": "NATIVE Send email — severe alert when one or more BYOK keys are revoked. Edit recipients in the UI.",
+      "action": "dynatrace.email:send-email",
+      "position": {
+        "x": -1,
+        "y": 2
+      },
+      "predecessors": [
+        "fetch_byok_notifications"
+      ],
+      "conditions": {
+        "states": {
+          "fetch_byok_notifications": "SUCCESS"
+        },
+        "custom": "{{ result('fetch_byok_notifications').hasRevoked }}",
+        "else": "STOP"
+      },
+      "input": {
+        "to": [
+          "byok-oncall@example.com"
+        ],
+        "cc": [],
+        "bcc": [],
+        "subject": "SEVERE: Dynatrace cannot access BYOK key — action required",
+        "content": "**SEVERE: Dynatrace cannot access the BYOK encryption key.**\n\nAffected key(s):\n\n{{ result('fetch_byok_notifications').revokedText }}\n\n**Impact:** {{ result('fetch_byok_notifications').impactText }}\n\nChecked window: {{ result('fetch_byok_notifications').checkedWindowStart }} → {{ result('fetch_byok_notifications').checkedWindowEnd }}\nRecords seen: {{ result('fetch_byok_notifications').recordsSeen }} | Revoked: {{ result('fetch_byok_notifications').revokedEvents }} | Incident-eligible: {{ result('fetch_byok_notifications').incidentCount }}\n"
+      }
+    },
+    "create_incident_byok_revoked": {
+      "name": "create_incident_byok_revoked",
+      "description": "NATIVE HTTP request — open a severity-1 incident (ServiceNow / generic webhook). Auth via Credential Vault. Fires only when a revoke passes the persistence safety gate.",
+      "action": "dynatrace.automations:http-function",
+      "position": {
+        "x": 1,
+        "y": 2
+      },
+      "predecessors": [
+        "fetch_byok_notifications"
+      ],
+      "conditions": {
+        "states": {
+          "fetch_byok_notifications": "SUCCESS"
+        },
+        "custom": "{{ result('fetch_byok_notifications').hasIncident }}",
+        "else": "STOP"
+      },
+      "input": {
+        "method": "POST",
+        "url": "https://YOUR_INCIDENT_WEBHOOK_ENDPOINT",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "failOnResponseCodes": "400-599",
+        "credential": {
+          "credentialId": "CREDENTIALS_VAULT-REPLACE_INCIDENT",
+          "type": "token",
+          "tokenPrefix": "Bearer"
+        },
+        "payload": "{\n  \"severity\": 1,\n  \"status\": \"open\",\n  \"short_description\": \"Dynatrace BYOK key access lost\",\n  \"description\": \"{{ result('fetch_byok_notifications').impactText }}\\n\\nEnvironment UUID: {{ result('fetch_byok_notifications').primaryRevoked.environmentUuid }}\\nKey name: {{ result('fetch_byok_notifications').primaryRevoked.keyName }}\\nNotification date: {{ result('fetch_byok_notifications').primaryRevoked.date }}\\nSeverity: {{ result('fetch_byok_notifications').primaryRevoked.severity }}\\nAffected key count: {{ result('fetch_byok_notifications').incidentCount }}\",\n  \"environmentUuid\": \"{{ result('fetch_byok_notifications').primaryRevoked.environmentUuid }}\",\n  \"keyName\": \"{{ result('fetch_byok_notifications').primaryRevoked.keyName }}\",\n  \"notificationDate\": \"{{ result('fetch_byok_notifications').primaryRevoked.date }}\",\n  \"dedupeKey\": \"{{ result('fetch_byok_notifications').primaryRevoked.dedupeKey }}\",\n  \"notificationType\": \"BYOK_REVOKED\"\n}\n"
+      }
+    },
+    "recovery_email_byok_activated": {
+      "name": "recovery_email_byok_activated",
+      "description": "NATIVE Send email — recovery notice when BYOK key access is restored. Edit recipients in the UI.",
+      "action": "dynatrace.email:send-email",
+      "position": {
+        "x": -1,
+        "y": 3
+      },
+      "predecessors": [
+        "fetch_byok_notifications"
+      ],
+      "conditions": {
+        "states": {
+          "fetch_byok_notifications": "SUCCESS"
+        },
+        "custom": "{{ result('fetch_byok_notifications').hasActivated }}",
+        "else": "STOP"
+      },
+      "input": {
+        "to": [
+          "byok-oncall@example.com"
+        ],
+        "cc": [],
+        "bcc": [],
+        "subject": "INFO: Dynatrace BYOK key access restored",
+        "content": "**INFO: BYOK key access restored.**\n\nRestored key(s):\n\n{{ result('fetch_byok_notifications').activatedText }}\n\nEnvironment: {{ result('fetch_byok_notifications').primaryActivated.environmentUuid }}\n\nChecked window: {{ result('fetch_byok_notifications').checkedWindowStart }} → {{ result('fetch_byok_notifications').checkedWindowEnd }}\n"
+      }
+    },
+    "resolve_incident_byok_activated": {
+      "name": "resolve_incident_byok_activated",
+      "description": "NATIVE HTTP request — resolve/update the external incident on recovery. Auth via Credential Vault. Optional — disable or repoint if you do not manage incidents externally.",
+      "action": "dynatrace.automations:http-function",
+      "position": {
+        "x": 1,
+        "y": 3
+      },
+      "predecessors": [
+        "fetch_byok_notifications"
+      ],
+      "conditions": {
+        "states": {
+          "fetch_byok_notifications": "SUCCESS"
+        },
+        "custom": "{{ result('fetch_byok_notifications').hasActivated }}",
+        "else": "STOP"
+      },
+      "input": {
+        "method": "POST",
+        "url": "https://YOUR_INCIDENT_WEBHOOK_ENDPOINT",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "failOnResponseCodes": "400-599",
+        "credential": {
+          "credentialId": "CREDENTIALS_VAULT-REPLACE_INCIDENT",
+          "type": "token",
+          "tokenPrefix": "Bearer"
+        },
+        "payload": "{\n  \"severity\": 3,\n  \"status\": \"resolved\",\n  \"short_description\": \"Dynatrace BYOK key access restored\",\n  \"description\": \"BYOK key access restored.\\n\\nEnvironment UUID: {{ result('fetch_byok_notifications').primaryActivated.environmentUuid }}\\nKey name: {{ result('fetch_byok_notifications').primaryActivated.keyName }}\\nNotification date: {{ result('fetch_byok_notifications').primaryActivated.date }}\",\n  \"environmentUuid\": \"{{ result('fetch_byok_notifications').primaryActivated.environmentUuid }}\",\n  \"keyName\": \"{{ result('fetch_byok_notifications').primaryActivated.keyName }}\",\n  \"notificationDate\": \"{{ result('fetch_byok_notifications').primaryActivated.date }}\",\n  \"dedupeKey\": \"{{ result('fetch_byok_notifications').primaryActivated.dedupeKey }}\",\n  \"notificationType\": \"BYOK_ACTIVATED\"\n}\n"
+      }
+    }
+  }
+}
