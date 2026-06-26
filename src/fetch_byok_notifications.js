@@ -1,38 +1,32 @@
 /**
  * BYOK Key Access Monitor — task: fetch_byok_notifications
  *
- * This is the ONLY code in the workflow. Everything a customer normally wants to
- * customize (notifications, incident creation, branching) is handled by NATIVE
- * workflow actions downstream (Send email, HTTP request, conditions). This task
- * only does the things that genuinely require code:
+ * Goal: detect BYOK key access changes and CREATE A DYNATRACE CUSTOM EVENT.
+ * From there, the customer decides what to do with the event (alert on it,
+ * trigger another workflow, build a dashboard/notebook, route to a 3rd party…).
  *
- *   1. Read OAuth client credentials from the Credential Vault (no hardcoded secrets).
- *   2. Get a bearer token from Dynatrace SSO (scope account-uac-read).
- *   3. POST the Account Management Notifications API (last 10 minutes,
- *      types BYOK_REVOKED / BYOK_ACTIVATED). There is NO native BYOK trigger;
+ * This task does the parts that genuinely require code:
+ *   1. Read secrets from the Credential Vault (no hardcoded secrets):
+ *        - OAuth client (User+password)  -> Account Management API
+ *        - Api-Token (Token)             -> events ingest
+ *   2. Get a bearer token from Dynatrace SSO (scope: account-uac-read).
+ *   3. POST the Account Management Notifications API for the last 10 minutes
+ *      (types BYOK_REVOKED / BYOK_ACTIVATED). There is NO native BYOK trigger;
  *      this API is the source of truth.
- *   4. Parse + deduplicate records and apply the persistence safety gate.
- *   5. Ingest a per-record Dynatrace custom event (loop -> needs code):
- *        BYOK_REVOKED   -> CUSTOM_ALERT "BYOK key access lost"
- *        BYOK_ACTIVATED -> CUSTOM_INFO  "BYOK key access restored"
- *   6. Return clean flags + pre-rendered text that the native downstream tasks
- *      consume via {{ result('fetch_byok_notifications').<field> }}.
- *
- * Downstream native tasks read these returned fields:
- *   hasRevoked, hasActivated, hasIncident   -> condition gates
- *   incidentCount                           -> incident payload
- *   primaryRevoked / primaryActivated       -> incident / recovery payloads
- *   revokedText / activatedText             -> email body (markdown)
+ *   4. Parse + de-duplicate records and apply the persistence safety gate.
+ *   5. Create a Dynatrace custom event per record (loop -> needs code) via
+ *      POST {env}/api/v2/events/ingest:
+ *        BYOK_REVOKED   -> CUSTOM_ALERT  "BYOK key access lost"
+ *        BYOK_ACTIVATED -> CUSTOM_INFO   "BYOK key access restored"
+ *   6. Return a summary plus flags/text that optional downstream native tasks
+ *      can consume via {{ result('fetch_byok_notifications').<field> }}.
  */
-import {
-  eventsClient,
-  EventIngestEventType,
-  credentialVaultClient,
-} from "@dynatrace-sdk/client-classic-environment-v2";
+import { credentialVaultClient } from "@dynatrace-sdk/client-classic-environment-v2";
+import { getEnvironmentUrl } from "@dynatrace-sdk/app-environment";
 import { queryExecutionClient } from "@dynatrace-sdk/client-query";
 
 // ---------------------------------------------------------------------------
-// Configuration — NO SECRETS INLINE. Set the two values below, then deploy.
+// Configuration — NO SECRETS INLINE. Set these three values, then deploy.
 // ---------------------------------------------------------------------------
 
 // Your Dynatrace account UUID (NOT a secret). Account Management > IAM > OAuth clients.
@@ -40,12 +34,16 @@ const ACCOUNT_UUID = "<REPLACE_WITH_ACCOUNT_UUID>";
 
 // Credential Vault entry of type "User and password":
 //   user     = OAuth client_id
-//   password = OAuth client_secret      (client needs scope: account-uac-read)
-const OAUTH_CREDENTIAL_VAULT_ID = "<REPLACE_WITH_CREDENTIALS_VAULT_ID>";
+//   password = OAuth client_secret      (client scope: account-uac-read)
+const OAUTH_CREDENTIAL_VAULT_ID = "<REPLACE_WITH_OAUTH_CREDENTIALS_VAULT_ID>";
+
+// Credential Vault entry of type "Token":
+//   token = a Dynatrace API token (Api-Token) with scope: events.ingest
+const EVENTS_TOKEN_VAULT_ID = "<REPLACE_WITH_EVENTS_INGEST_TOKEN_VAULT_ID>";
 
 // Behavior knobs.
 const LOOKBACK_MINUTES = 10;
-const SAFETY_MIN_PERSIST_MINUTES = 5; // only flag an incident if a revoke is at least this old and not yet recovered
+const SAFETY_MIN_PERSIST_MINUTES = 5; // mark a revoke "incident eligible" only if at least this old and not recovered
 const ENABLE_PERSISTENCE_SAFETY = true;
 const ENABLE_CROSS_RUN_DEDUP = true; // best-effort dedup across overlapping runs (Grail); degrades gracefully
 
@@ -85,6 +83,19 @@ function requireConfigured(value, label) {
   return value;
 }
 
+// The environment (classic) API lives on the non-apps host, e.g.
+// https://abc123.apps.dynatrace.com -> https://abc123.dynatrace.com
+function getClassicEnvBaseUrl() {
+  const raw = (getEnvironmentUrl() || "").trim();
+  if (!raw) throw new Error("getEnvironmentUrl() returned an empty value.");
+  const env = new URL(raw);
+  env.host = env.host.replace(".apps.", ".");
+  env.pathname = "";
+  env.search = "";
+  env.hash = "";
+  return env.toString().replace(/\/$/, "");
+}
+
 async function resolveOauthCredentials() {
   requireConfigured(OAUTH_CREDENTIAL_VAULT_ID, "OAUTH_CREDENTIAL_VAULT_ID");
   const entry = await credentialVaultClient.getCredentialsDetails({ id: OAUTH_CREDENTIAL_VAULT_ID });
@@ -97,6 +108,18 @@ async function resolveOauthCredentials() {
     );
   }
   return { clientId, clientSecret };
+}
+
+async function resolveEventsToken() {
+  requireConfigured(EVENTS_TOKEN_VAULT_ID, "EVENTS_TOKEN_VAULT_ID");
+  const entry = await credentialVaultClient.getCredentialsDetails({ id: EVENTS_TOKEN_VAULT_ID });
+  if (!entry || !entry.token) {
+    throw new Error(
+      `Credential Vault entry ${EVENTS_TOKEN_VAULT_ID} must be a "Token" entry containing a ` +
+        "Dynatrace API token with the events.ingest scope.",
+    );
+  }
+  return entry.token;
 }
 
 async function getOauthToken({ clientId, clientSecret }) {
@@ -140,8 +163,19 @@ async function fetchNotifications(token, startDateTime, endDateTime) {
   return text ? JSON.parse(text) : {};
 }
 
-async function ingestEvent({ eventType, title, properties }) {
-  return await eventsClient.createEvent({ body: { eventType, title, properties } });
+// Create a Dynatrace custom event via the classic environment API.
+// eventType is CUSTOM_ALERT (revoked) or CUSTOM_INFO (recovery).
+async function ingestCustomEvent(baseUrl, apiToken, { eventType, title, properties }) {
+  const response = await fetch(`${baseUrl}/api/v2/events/ingest`, {
+    method: "POST",
+    headers: { Authorization: `Api-Token ${apiToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ eventType, title, properties }),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`Event ingest failed. Status ${response.status}. Body: ${text}`);
+  }
+  return text ? JSON.parse(text) : {};
 }
 
 // Best-effort cross-run dedup. Overlapping 10-minute windows on a 5-minute
@@ -182,7 +216,10 @@ export default async function () {
   const checkedWindowStart = isoMinutesAgo(LOOKBACK_MINUTES);
   const checkedWindowEnd = nowIso();
 
+  const baseUrl = getClassicEnvBaseUrl();
+  const apiToken = await resolveEventsToken();
   const token = await getOauthToken(await resolveOauthCredentials());
+
   const apiResponse = await fetchNotifications(token, checkedWindowStart, checkedWindowEnd);
   const records = Array.isArray(apiResponse.records) ? apiResponse.records : [];
 
@@ -202,12 +239,13 @@ export default async function () {
     recordsSeen: records.length,
     revokedEvents: 0,
     activatedEvents: 0,
+    eventsCreated: 0,
     processed: [],
   };
 
   const revoked = [];
   const activated = [];
-  let primaryRevoked = null; // most recent revoke that passed the safety gate (incident source)
+  let primaryRevoked = null; // most recent revoke that passed the safety gate
 
   const seen = new Set(); // in-window dedup: type + environmentUuid + keyName + date
 
@@ -247,14 +285,15 @@ export default async function () {
       summary.revokedEvents += 1;
       revoked.push(item);
 
-      await ingestEvent({
-        eventType: EventIngestEventType.CustomAlert,
+      // The custom event — the integration point. Customer decides downstream.
+      await ingestCustomEvent(baseUrl, apiToken, {
+        eventType: "CUSTOM_ALERT",
         title: "BYOK key access lost",
         properties: { ...baseProperties, impact: REVOKED_IMPACT },
       });
+      summary.eventsCreated += 1;
 
-      // Persistence safety gate (requirement #6): incident only if the revoke is
-      // at least SAFETY_MIN_PERSIST_MINUTES old AND not followed by an activation.
+      // Persistence safety gate (requirement: incident only if revoke persists >5m).
       const revokeTs = Date.parse(date) || 0;
       const ageMinutes = revokeTs ? (Date.now() - revokeTs) / 60000 : Infinity;
       const recoveredAfter = (latestActivationByTarget.get(`${environmentUuid}|${keyName}`) || 0) > revokeTs;
@@ -269,17 +308,21 @@ export default async function () {
         environmentUuid,
         keyName,
         date,
-        action: passesGate ? "custom_event_ingested_incident_eligible" : "custom_event_ingested_incident_suppressed",
+        action: "custom_alert_event_created",
+        incidentEligible: passesGate,
       });
     } else {
       summary.activatedEvents += 1;
       activated.push(item);
-      await ingestEvent({
-        eventType: EventIngestEventType.CustomInfo,
+
+      await ingestCustomEvent(baseUrl, apiToken, {
+        eventType: "CUSTOM_INFO",
         title: "BYOK key access restored",
         properties: baseProperties,
       });
-      summary.processed.push({ eventType, environmentUuid, keyName, date, action: "custom_event_ingested_recovery" });
+      summary.eventsCreated += 1;
+
+      summary.processed.push({ eventType, environmentUuid, keyName, date, action: "custom_info_event_created" });
     }
   }
 
@@ -297,19 +340,16 @@ export default async function () {
 
   return {
     ...summary,
-    // Flags for native condition gates:
+    // Flags for OPTIONAL downstream native tasks (see the extended variant):
     hasRevoked: revoked.length > 0,
     hasActivated: activated.length > 0,
     hasIncident: incidentCount > 0,
     incidentCount,
-    // Representative records for native incident/recovery payloads:
     primaryRevoked: primaryRevoked || (revoked.length ? revoked[0] : null),
     primaryActivated,
     impactText: REVOKED_IMPACT,
-    // Pre-rendered markdown for native Send-email bodies:
     revokedText: revoked.length ? renderList(revoked) : "None",
     activatedText: activated.length ? renderList(activated) : "None",
-    // Lists if you want to template over them:
     revoked,
     activated,
   };

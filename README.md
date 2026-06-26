@@ -2,98 +2,155 @@
 
 **BYOK Key Access Monitor** — a portable [Dynatrace Workflow](https://docs.dynatrace.com/docs/analyze-explore-automate/workflows)
 that detects when a **Bring-Your-Own-Key (BYOK)** encryption key becomes
-inaccessible and alerts + opens/resolves an external incident.
+inaccessible and **creates a Dynatrace custom event**. From there, *you* decide
+what to do with the event (alert on it, trigger another workflow, build a
+dashboard, route it to a third party…).
 
 > There is **no native BYOK trigger** in Dynatrace. This workflow treats the
 > [Account Management Notifications API](https://docs.dynatrace.com/docs/dynatrace-api/account-management-api/post-notifications)
 > as the source of truth and polls it every 5 minutes.
+
+| BYOK notification | Custom event created |
+|-------------------|----------------------|
+| `BYOK_REVOKED` (Dynatrace lost key access) | **`CUSTOM_ALERT`** — *"BYOK key access lost"* |
+| `BYOK_ACTIVATED` (access restored) | **`CUSTOM_INFO`** — *"BYOK key access restored"* |
+
+Each event carries `environment_uuid`, `key_name`, `severity`, `message`,
+`notification_date`, an `impact` description, and a `byok_dedupe_key`.
 
 ---
 
 ## 🚀 Deploy in 2 minutes (Upload button)
 
 1. **Download the workflow file** — [`byok-key-access-monitor.workflow.json`](byok-key-access-monitor.workflow.json)
-   (open it, then use the *Download raw file* button, or `Save link as…`).
+   (open it → *Download raw file*).
 2. In Dynatrace, open **Workflows** → click **Upload** → choose the JSON file.
    See [Upload a workflow](https://docs.dynatrace.com/docs/analyze-explore-automate/workflows/manage-workflows/workflows-upload).
-3. On the **Import workflow** screen, Dynatrace lists the **required app**
-   (*Email*) and asks for any **connections** — confirm, then select **Import**.
-4. The workflow opens in the editor **disabled**. Fill in the 4 placeholders
-   below, then enable it.
+3. On the **Import workflow** screen, confirm any required apps/connections → **Import**.
+4. The workflow opens **disabled**. Fill in the 3 placeholders below, then enable it.
 
-That's it — no CLI required.
+### Fill in after upload (task `fetch_byok_notifications`, top of the script)
 
-### Fill in after upload (in the workflow editor)
+| Placeholder | Set to |
+|-------------|--------|
+| `ACCOUNT_UUID` | your Dynatrace account UUID |
+| `OAUTH_CREDENTIAL_VAULT_ID` | Credential Vault ID of the OAuth client (token #1 below) |
+| `EVENTS_TOKEN_VAULT_ID` | Credential Vault ID of the events-ingest API token (token #2 below) |
 
-| Where | Placeholder | Set to |
-|-------|-------------|--------|
-| Task **`fetch_byok_notifications`** (JS, top of file) | `ACCOUNT_UUID` | your Dynatrace account UUID |
-| same | `OAUTH_CREDENTIAL_VAULT_ID` | Credential Vault ID of the OAuth client (see below) |
-| Tasks **`alert_email_…`** / **`recovery_email_…`** | `to: ["byok-oncall@example.com"]` | real recipient(s) |
-| Tasks **`create_incident_…`** / **`resolve_incident_…`** | `url` + Authentication credential | your incident endpoint + its vault credential |
-
-> Don't manage incidents externally? Just delete the two `*_incident_*` tasks.
-> The email + custom-event paths work on their own.
+> **No secrets live in the workflow file** — only the Credential Vault *IDs*.
 
 ---
 
-## 🔧 One-time setup (secrets in the Credential Vault)
+## 🔑 Get your Dynatrace tokens
 
-No secrets are stored in the workflow file — they live in the
-[Credential Vault](https://developer.dynatrace.com/develop/guides/security/manage-secrets/).
+You need **two** Dynatrace credentials. Create each, then store it in the
+[Credential Vault](https://developer.dynatrace.com/develop/guides/security/manage-secrets/)
+and paste the **vault ID** into the script.
 
-1. **Create an Account Management OAuth client**
-   (*Account Management → Identity & access management → OAuth clients*) with scope
-   **`account-uac-read`**. Note the **client ID**, **client secret**, and **account UUID**.
-2. **Create vault entries** (mark them available to AppEngine / workflows):
+### Token #1 — Account Management **OAuth client** (read notifications)
 
-   | Vault entry | Type | Fields |
-   |-------------|------|--------|
-   | OAuth client | **User and password** | user = client ID, password = client secret |
-   | Incident webhook auth *(optional)* | **Token** | token = your incident system's API token |
+The Notifications API lives on `api.dynatrace.com` and is authenticated with an
+account-level OAuth client (not an environment token).
 
-3. Paste the OAuth vault ID into `OAUTH_CREDENTIAL_VAULT_ID`, and select the
-   incident Token credential in the HTTP tasks' **Authentication** section.
+1. Go to **Account Management** → **Identity & access management** → **OAuth clients**.
+   (Account Management is at <https://account.dynatrace.com>; pick your account if you have several.)
+2. Select **Create client**. Provide a service-user email and a description.
+3. Under **Permissions / scopes**, add **`account-uac-read`**
+   *(Allow read access for usage and consumption resources)*.
+4. Create the client and **copy the Client ID and Client secret now** (the secret
+   is shown only once).
+5. Copy your **Account UUID** — it's shown on the OAuth clients page (and in the
+   client details). This is the `ACCOUNT_UUID` value.
 
-### Permissions (workflow run-as user)
-- `events.ingest` — ingest the custom events.
-- `storage:events:read` — optional, for cross-run dedup (degrades gracefully).
-- Read access to the referenced Credential Vault entries.
+Docs: [Authenticate to Account Management with OAuth clients](https://docs.dynatrace.com/docs/manage/account-management/identity-access-management/oauth).
+
+**Store it:** Credential Vault → **Add credential** → type **User and password**
+→ *Username* = Client ID, *Password* = Client secret. Copy the resulting
+`CREDENTIALS_VAULT-…` ID → `OAUTH_CREDENTIAL_VAULT_ID`.
+
+### Token #2 — Environment **API token** (ingest the custom event)
+
+The custom event is written with `POST /api/v2/events/ingest`, which needs an
+environment API token.
+
+1. In your environment, go to **Settings → Access tokens → Generate new token**
+   (Platform: **Access Tokens** app → **Generate new token**).
+2. Name it (e.g. `byok-events-ingest`) and select the scope **Ingest events**
+   (`events.ingest`).
+3. **Generate** and copy the token (`dt0c01.…`), shown only once.
+
+Docs: [Access tokens](https://docs.dynatrace.com/docs/manage/identity-access-management/access-tokens-and-oauth-clients/access-tokens)
+· [Events POST ingest](https://docs.dynatrace.com/docs/dynatrace-api/environment-api/events-v2/post-event).
+
+**Store it:** Credential Vault → **Add credential** → type **Token** → paste the
+API token. Copy the `CREDENTIALS_VAULT-…` ID → `EVENTS_TOKEN_VAULT_ID`.
+
+> Mark **both** vault entries as **available to AppEngine / workflows** so the
+> workflow can read them.
+
+### Token summary
+
+| # | Credential | Scope / type | Vault entry type | Script variable |
+|---|------------|--------------|------------------|-----------------|
+| 1 | Account Management OAuth client | `account-uac-read` | User and password (id/secret) | `OAUTH_CREDENTIAL_VAULT_ID` |
+| 2 | Environment API token | `events.ingest` | Token | `EVENTS_TOKEN_VAULT_ID` |
+
+The workflow's run-as user also needs **read access** to these vault entries
+(and `storage:events:read` if you keep the optional cross-run dedup check).
+
+---
+
+## 🧩 What to do with the custom event
+
+The workflow's job ends at creating the event. Common next steps — pick any:
+
+- **Alert on it** — In *Settings → Anomaly detection → Custom events for alerting*,
+  raise a problem when a `BYOK key access lost` event appears, then use your
+  existing problem notifications (Slack, email, PagerDuty, ServiceNow…).
+- **Trigger another workflow** — Build a second workflow with a **Davis problem /
+  event trigger** filtered to `event.name == "BYOK key access lost"` and do
+  whatever you like (open a ticket, page on-call, run automation).
+- **Query / visualize** — `fetch events | filter event.name == "BYOK key access lost"`
+  in a Notebook or Dashboard tile.
+- **Want a ready-made example?** Use the **extended** workflow below, which adds
+  native *Send email* + *incident webhook* tasks that react to the same result.
+
+---
+
+## 📦 Two workflow files
+
+| File | What it does |
+|------|--------------|
+| [`byok-key-access-monitor.workflow.json`](byok-key-access-monitor.workflow.json) | **Default.** Schedule + one JS task that **creates the custom event**. |
+| [`byok-key-access-monitor.extended.workflow.json`](byok-key-access-monitor.extended.workflow.json) | Optional. Same, **plus** native *Send email* and *HTTP incident* tasks (delete the ones you don't want). |
+
+The extended variant needs two more things after upload:
+recipient address(es) on the email tasks, and an incident endpoint URL +
+its own **Token** vault credential on the two `*_incident_*` HTTP tasks.
 
 ---
 
 ## How it works (native-first design)
 
-Everything you customize is a **native** action editable in the Workflows UI.
 Only the unavoidable bits (OAuth, API paging, looping + dedup, per-record event
-ingest) live in **one** small Run JavaScript task.
+creation) live in **one** small Run JavaScript task. The optional extended
+variant keeps every customer-facing action as a **native**, UI-editable step.
 
 ```
 [Schedule: every 5 min]
         │
         ▼
-fetch_byok_notifications            (Run JavaScript)  ← only code
-        ├───────────────┬───────────────────┬───────────────────────┐
-        ▼               ▼                   ▼                       ▼
-alert_email_…       create_incident_…   recovery_email_…       resolve_incident_…
-(Send email)        (HTTP request)      (Send email)           (HTTP request)
- if hasRevoked       if hasIncident      if hasActivated        if hasActivated
+fetch_byok_notifications   (Run JavaScript)  → CREATES Dynatrace custom event(s)
+        │                                       (default workflow stops here)
+        └── (extended only) ─┬───────────────┬───────────────────┬──────────────┐
+                             ▼               ▼                   ▼              ▼
+                       alert_email_…   create_incident_…   recovery_email_…  resolve_incident_…
+                       if hasRevoked   if hasIncident      if hasActivated   if hasActivated
 ```
 
-| Step | Action | Native? | Gate |
-|------|--------|---------|------|
-| Trigger | Schedule `*/5 * * * *` | native | — |
-| `fetch_byok_notifications` | Run JavaScript | code (required) | — |
-| `alert_email_byok_revoked` | Send email | **native** | `hasRevoked` |
-| `create_incident_byok_revoked` | HTTP request (vault auth) | **native** | `hasIncident` |
-| `recovery_email_byok_activated` | Send email | **native** | `hasActivated` |
-| `resolve_incident_byok_activated` | HTTP request (vault auth) | **native** | `hasActivated` |
-
-On **`BYOK_REVOKED`**: ingest `CUSTOM_ALERT` "BYOK key access lost" → email →
-severity-1 incident (after a 5-minute persistence safety gate).
-On **`BYOK_ACTIVATED`**: ingest `CUSTOM_INFO` "BYOK key access restored" → recovery
-email → resolve incident. Records are de-duplicated by
-`type + environmentUuid + keyName + date`.
+Records are de-duplicated by `type + environmentUuid + keyName + date`. The
+`CUSTOM_ALERT` is always created; in the extended variant the external incident
+is additionally gated by a 5-minute persistence safety check.
 
 ---
 
@@ -101,18 +158,20 @@ email → resolve incident. Records are de-duplicated by
 
 | Path | Purpose |
 |------|---------|
-| `byok-key-access-monitor.workflow.json` | **Upload this** to the Workflows app. Built artifact (committed). |
+| `byok-key-access-monitor.workflow.json` | **Upload this** (default, event-only). Built artifact. |
+| `byok-key-access-monitor.extended.workflow.json` | Optional extended variant. Built artifact. |
 | `src/fetch_byok_notifications.js` | Source of the Run JavaScript task. |
-| `src/assets/*.md`, `src/assets/*.json` | Email bodies + incident payload templates. |
-| `src/workflow.base.json` | Task wiring / conditions (placeholders filled by the build). |
-| `build.sh` | Reassembles `byok-key-access-monitor.workflow.json` from `src/`. |
+| `src/workflow.base.json` | Focused task wiring. |
+| `src/workflow.extended.base.json` | Extended task wiring (email + incident). |
+| `src/assets/*` | Email bodies + incident payload templates (extended). |
+| `build.sh` | Rebuilds both workflow JSON files from `src/` (needs `jq`). |
 
-### Editing the source
+### Editing
 
-Prefer editing in `src/` and rebuilding (keeps escaping correct), then re-upload:
+Edit files in `src/`, then rebuild and re-upload:
 
 ```bash
-./build.sh   # requires jq
+./build.sh
 ```
 
 ### Optional: deploy with dtctl instead of the Upload button
@@ -128,11 +187,11 @@ dtctl apply -f byok-key-access-monitor.workflow.json --write-id  # create
 
 - API filter values are `BYOK_REVOKED` / `BYOK_ACTIVATED`; the API returns record
   `type` as lower-hyphen (`byok-revoked`). The script normalizes both.
-- The custom event "BYOK key access lost" is always ingested for visibility; only
-  the external **incident** is gated by the persistence safety check.
-- The native HTTP request action injects the vault secret into the standard
-  `Authorization` header (`tokenPrefix` + token); custom auth header names are not
-  supported by that action.
+- The environment API host differs from the apps host; the script derives it from
+  `getEnvironmentUrl()` (`*.apps.*` → `*.*`).
+- Knobs at the top of the script: `LOOKBACK_MINUTES` (10),
+  `SAFETY_MIN_PERSIST_MINUTES` (5), `ENABLE_PERSISTENCE_SAFETY`,
+  `ENABLE_CROSS_RUN_DEDUP`.
 
 ## License
 
